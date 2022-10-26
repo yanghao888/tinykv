@@ -60,7 +60,14 @@ func NewStandaloneReader(txn *badger.Txn) *StandaloneReader {
 }
 
 func (s *StandaloneReader) GetCF(cf string, key []byte) ([]byte, error) {
-	return engine_util.GetCFFromTxn(s.txn, cf, key)
+	val, err := engine_util.GetCFFromTxn(s.txn, cf, key)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return val, nil
 }
 
 func (s *StandaloneReader) IterCF(cf string) engine_util.DBIterator {
