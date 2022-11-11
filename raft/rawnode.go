@@ -154,7 +154,6 @@ func (rn *RawNode) Step(m pb.Message) error {
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
 	rd := rn.readyWithoutAccept()
-	rn.acceptReady(rd)
 	return rd
 }
 

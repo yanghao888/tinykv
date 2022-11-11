@@ -130,9 +130,7 @@ type Progress struct {
 }
 
 type Raft struct {
-	majority int
-	peers    []uint64
-	id       uint64
+	id uint64
 
 	Term uint64
 	Vote uint64
@@ -182,6 +180,7 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
 
+	majority                  int
 	randomizedElectionTimeout int
 	logger                    *log.Logger
 }
@@ -193,21 +192,35 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	raftLog := newLog(c.Storage)
-	hs, _, err := c.Storage.InitialState()
+	hs, cs, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
 	}
 	raftLog.committed = hs.Commit
+
+	var peers []uint64
+	if c.peers != nil {
+		peers = c.peers
+	} else {
+		peers = cs.Nodes
+	}
+	if len(peers) == 0 {
+		peers = append(peers, c.ID)
+	}
+	prs := make(map[uint64]*Progress)
+	for _, id := range peers {
+		prs[id] = new(Progress)
+	}
 	r := &Raft{
-		majority:         len(c.peers)/2 + 1,
-		peers:            c.peers,
 		id:               c.ID,
 		Term:             hs.Term,
 		Vote:             hs.Vote,
 		RaftLog:          raftLog,
+		Prs:              prs,
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
+		majority:         len(peers)/2 + 1,
 		logger:           log.NewLogger(os.Stdout, ""),
 	}
 	r.becomeFollower(r.Term, None)
@@ -332,16 +345,7 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
 
-	if r.Prs == nil {
-		r.Prs = make(map[uint64]*Progress)
-	}
-
-	for _, id := range r.peers {
-		pr := r.Prs[id]
-		if pr == nil {
-			pr = new(Progress)
-			r.Prs[id] = pr
-		}
+	for id, pr := range r.Prs {
 		pr.Match = 0
 		pr.Next = r.RaftLog.LastIndex() + 1
 		if id == r.id {
@@ -423,7 +427,7 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 				return
 			}
 		}
-		if len(r.votes) == len(r.peers) {
+		if len(r.votes) == len(r.Prs) {
 			r.becomeFollower(r.Term, None)
 		}
 	case pb.MessageType_MsgHeartbeat:
@@ -437,7 +441,7 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 func (r *Raft) stepLeader(m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
-		for _, id := range r.peers {
+		for id := range r.Prs {
 			if id == r.id {
 				continue
 			}
@@ -459,8 +463,9 @@ func (r *Raft) stepLeader(m pb.Message) {
 	case pb.MessageType_MsgHeartbeatResponse:
 		if m.Term > r.Term {
 			r.becomeFollower(m.Term, None)
+			return
 		}
-		if m.Index < r.RaftLog.LastIndex() || m.LogTerm == r.RaftLog.lastTerm() {
+		if m.LogTerm < r.RaftLog.lastTerm() || m.LogTerm == r.RaftLog.lastTerm() && m.Index < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
 	case pb.MessageType_MsgAppend:
@@ -502,7 +507,7 @@ func (r *Raft) startElection() {
 		r.becomeLeader()
 		return
 	}
-	for _, id := range r.peers {
+	for id := range r.Prs {
 		if id == r.id {
 			continue
 		}
@@ -632,8 +637,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	if m.Term >= r.Term {
 		r.becomeFollower(m.Term, m.From)
 	}
-	m.Index = r.RaftLog.LastIndex()
-	m.LogTerm = r.RaftLog.lastTerm()
+	resp.Index = r.RaftLog.LastIndex()
+	resp.LogTerm = r.RaftLog.lastTerm()
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -669,7 +674,7 @@ func (r *Raft) appendEntry(ents ...*pb.Entry) {
 }
 
 func (r *Raft) standalone() bool {
-	return len(r.peers) == 1 && r.peers[0] == r.id
+	return len(r.Prs) == 1 && r.Prs[r.id] != nil
 }
 
 func (r *Raft) updateLeaderCommit() bool {
@@ -694,7 +699,7 @@ func (r *Raft) updateLeaderCommit() bool {
 }
 
 func (r *Raft) broadcastAppend() {
-	for _, id := range r.peers {
+	for id := range r.Prs {
 		if id == r.id {
 			continue
 		}
