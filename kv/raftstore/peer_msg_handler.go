@@ -5,7 +5,6 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"github.com/pingcap-incubator/tinykv/raft"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -52,7 +51,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		_, err := d.peerStorage.SaveReadyState(&ready)
 		if err != nil {
 			log.Errorf("%s handle raft ready error %v", d.Tag, err)
-			return
+			panic(err)
 		}
 
 		d.Send(d.ctx.trans, ready.Messages)
@@ -61,10 +60,15 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			if entry.Data == nil {
 				continue
 			}
+			var proposalIndex = -1
 			var cb *message.Callback
-			for _, proposal := range d.proposals {
-				if proposal.index == entry.Index && proposal.term == entry.Term {
+			for i, proposal := range d.proposals {
+				if proposal.term < entry.Term {
+					NotifyStaleReq(d.Term(), proposal.cb)
+					proposalIndex = i
+				} else if proposal.index == entry.Index && proposal.term == entry.Term {
 					cb = proposal.cb
+					proposalIndex = i
 					break
 				}
 			}
@@ -80,6 +84,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				}
 				d.handleCmd(&cmd, cb)
 			case eraftpb.EntryType_EntryConfChange:
+			}
+			if proposalIndex != -1 {
+				d.proposals = d.proposals[proposalIndex+1:]
 			}
 		}
 		d.RaftGroup.Advance(ready)
@@ -155,10 +162,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	if !d.IsLeader() {
-		cb.Done(ErrResp(raft.ErrProposalDropped))
-		return
-	}
 	data, err := proto.Marshal(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
