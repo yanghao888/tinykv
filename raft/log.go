@@ -17,6 +17,7 @@ package raft
 import (
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pkg/errors"
 )
 
 // RaftLog manage the log entries, its struct look like:
@@ -76,13 +77,20 @@ func newLog(storage Storage) *RaftLog {
 	if err != nil {
 		panic(err)
 	}
-	l := new(RaftLog)
-	l.storage = storage
-	l.applied = firstIndex - 1
-	l.stabled = lastIndex
-	l.entries = entries
-	l.dummyIndex = firstIndex - 1
-	return l
+	truncatedIndex := firstIndex - 1
+	truncatedTerm, err := storage.Term(truncatedIndex)
+	if err != nil {
+		panic(err)
+	}
+
+	return &RaftLog{
+		storage:    storage,
+		committed:  truncatedIndex,
+		applied:    truncatedIndex,
+		stabled:    lastIndex,
+		entries:    append([]pb.Entry{{Term: truncatedTerm, Index: truncatedIndex}}, entries...),
+		dummyIndex: truncatedIndex,
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -90,6 +98,11 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	newFirstIndex, _ := l.storage.FirstIndex()
+	newTruncatedIndex := newFirstIndex - 1
+	if newTruncatedIndex > l.dummyIndex {
+		l.entries = append([]pb.Entry{}, l.entries[newTruncatedIndex-l.dummyIndex:]...)
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -97,34 +110,37 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries
+	return l.entries[1:]
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries[l.stabled-l.dummyIndex:]
+	return l.entries[l.stabled+1-l.dummyIndex:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return l.entries[l.applied-l.dummyIndex : l.committed-l.dummyIndex]
+	return l.entries[l.applied+1-l.dummyIndex : l.committed+1-l.dummyIndex]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return l.dummyIndex + uint64(len(l.entries))
+	return l.dummyIndex + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if i > l.dummyIndex {
-		return l.entries[i-l.dummyIndex-1].Term, nil
+	if i > l.LastIndex() {
+		return 0, errors.Errorf("Index is out of bound, lastIndex %d", l.LastIndex())
 	}
-	return l.storage.Term(i)
+	if i < l.dummyIndex {
+		return 0, ErrCompacted
+	}
+	return l.entries[i-l.dummyIndex].Term, nil
 }
 
 func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
@@ -149,13 +165,13 @@ func (l *RaftLog) entriesStartAt(index uint64) []pb.Entry {
 	if index <= l.dummyIndex {
 		panic("index is unavailable due to compaction")
 	}
-	return l.entries[index-l.dummyIndex-1:]
+	return l.entries[index-l.dummyIndex:]
 }
 
 func (l *RaftLog) deleteFrom(index uint64) {
 	if index <= l.dummyIndex {
 		panic("index is unavailable due to compaction")
 	}
-	l.entries = l.entries[:index-l.dummyIndex-1]
+	l.entries = l.entries[:index-l.dummyIndex]
 	l.stabled = min(l.stabled, l.LastIndex())
 }

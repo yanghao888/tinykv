@@ -233,16 +233,18 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	nextIndex := r.Prs[to].Next
 	if nextIndex <= r.RaftLog.dummyIndex {
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			r.logger.Errorf("error occurred during sending snapshot: %v", err)
+			return false
+		}
 		// Send snapshot
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType:  pb.MessageType_MsgSnapshot,
 			To:       to,
 			From:     r.id,
 			Term:     r.Term,
-			LogTerm:  0,
-			Index:    0,
-			Commit:   0,
-			Snapshot: nil,
+			Snapshot: &snapshot,
 		})
 		return true
 	}
@@ -250,7 +252,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := nextIndex - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err != nil {
-		r.logger.Debugf("error occurred during sending append: %v", err)
+		r.logger.Errorf("error occurred during sending append: %v", err)
 		return false
 	}
 	ents := r.RaftLog.entriesStartAt(nextIndex)
@@ -399,6 +401,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -434,6 +438,8 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -498,6 +504,8 @@ func (r *Raft) stepLeader(m pb.Message) {
 		}
 		r.Prs[m.From].Next = m.Index
 		r.sendAppend(m.From)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 }
 
@@ -644,6 +652,47 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	resp := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Reject:  true,
+	}
+	defer func() {
+		resp.Term = r.Term
+		r.msgs = append(r.msgs, resp)
+	}()
+
+	if m.Term < r.Term {
+		return
+	}
+	metadata := m.Snapshot.Metadata
+	if metadata.Index <= r.RaftLog.committed {
+		resp.Index = r.RaftLog.committed
+		return
+	}
+
+	r.becomeFollower(m.Term, m.From)
+
+	if metadata.Term > r.RaftLog.lastTerm() || metadata.Term == r.RaftLog.lastTerm() && metadata.Index > r.RaftLog.LastIndex() {
+		r.RaftLog.entries = []pb.Entry{{Term: metadata.Term, Index: metadata.Index}}
+	} else {
+		r.RaftLog.entries = append([]pb.Entry{}, r.RaftLog.entries[metadata.Index:]...)
+	}
+	r.RaftLog.committed = metadata.Index
+	r.RaftLog.applied = metadata.Index
+	r.RaftLog.stabled = metadata.Index
+	r.RaftLog.dummyIndex = metadata.Index
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range metadata.ConfState.Nodes {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
+	}
+
+	resp.Index = r.RaftLog.LastIndex()
+	resp.Reject = false
+
 }
 
 // addNode add a new node to raft group

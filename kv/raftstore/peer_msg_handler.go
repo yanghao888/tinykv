@@ -3,6 +3,7 @@ package raftstore
 import (
 	"fmt"
 	"github.com/golang/protobuf/proto"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
@@ -667,6 +668,20 @@ func (d *peerMsgHandler) handleNormalRequests(requests []*raft_cmdpb.Request, cb
 }
 
 func (d *peerMsgHandler) handleAdminRequest(request *raft_cmdpb.AdminRequest, cb *message.Callback) {
+	switch request.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		compactTerm, compactIndex := request.CompactLog.CompactTerm, request.CompactLog.CompactIndex
+		currentTruncatedTerm, currentTruncatedIndex := d.peerStorage.truncatedTerm(), d.peerStorage.truncatedIndex()
+		if compactTerm > currentTruncatedTerm || compactTerm == currentTruncatedTerm && compactIndex > currentTruncatedIndex {
+			applyState := d.peerStorage.applyState
+			applyState.TruncatedState.Term = compactTerm
+			applyState.TruncatedState.Index = compactIndex
+			if err := engine_util.PutMeta(d.ctx.engine.Kv, meta.ApplyStateKey(d.regionId), applyState); err != nil {
+				log.Panicf("%s write apply state error %v", d.Tag, err)
+			}
+			d.ScheduleCompactLog(compactIndex)
+		}
+	}
 }
 
 func newAdminRequest(regionID uint64, peer *metapb.Peer) *raft_cmdpb.RaftCmdRequest {

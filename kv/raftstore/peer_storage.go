@@ -340,21 +340,11 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 	// Update raftState
 	lastEntry := entries[len(entries)-1]
-	newRaftState := &rspb.RaftLocalState{
-		HardState: ps.raftState.HardState,
-		LastIndex: lastEntry.Index,
-		LastTerm:  lastEntry.Term,
-	}
-	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), newRaftState); err != nil {
+	ps.raftState.LastTerm, ps.raftState.LastIndex = lastEntry.Term, lastEntry.Index
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
 		return errors.WithStack(err)
 	}
 
-	// Write to db
-	if err := ps.Engines.WriteRaft(raftWB); err != nil {
-		return errors.WithStack(err)
-	}
-
-	ps.raftState = newRaftState
 	return nil
 }
 
@@ -370,7 +360,45 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	ps.raftState.LastTerm, ps.raftState.LastIndex = snapshot.Metadata.Term, snapshot.Metadata.Index
+
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term, ps.applyState.TruncatedState.Index = snapshot.Metadata.Term, snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
+		return nil, err
+	}
+
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	ch := make(chan bool)
+	ps.regionSched <- runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
+	}
+	if ok := <-ch; !ok {
+		return nil, errors.Errorf("%v apply snapshot error", ps.Tag)
+	}
+
+	result := &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	ps.SetRegion(snapData.Region)
+	return result, nil
 }
 
 // Save memory states to disk.
@@ -383,48 +411,41 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 
 	var err error
+	var result *ApplySnapResult
 
-	/*kvWB := new(engine_util.WriteBatch)
-	raftWB := new(engine_util.WriteBatch)
-	snapshot := &ready.Snapshot
-	if !raft.IsEmptySnap(snapshot) && ps.validateSnap(snapshot) {
-		//ps.snapState.StateType
-		if result, err = ps.ApplySnapshot(snapshot, kvWB, raftWB); err != nil {
-			return nil, err
-		}
-	}*/
+	kvWB, raftWB := new(engine_util.WriteBatch), new(engine_util.WriteBatch)
 
 	if hardSt := ready.HardState; !raft.IsEmptyHardState(hardSt) {
 		ps.raftState.HardState = &hardSt
-		if len(ready.Entries) == 0 {
-			err = engine_util.PutMeta(ps.Engines.Raft, meta.RaftStateKey(ps.region.Id), ps.raftState)
-			if err != nil {
-				return nil, err
-			}
+		if err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+			return nil, err
+		}
+	}
+
+	snapshot := &ready.Snapshot
+	if !raft.IsEmptySnap(snapshot) && ps.validateSnap(snapshot) {
+		if result, err = ps.ApplySnapshot(snapshot, kvWB, raftWB); err != nil {
+			return nil, err
 		}
 	}
 
 	if len(ready.Entries) > 0 {
-		raftWB := new(engine_util.WriteBatch)
 		if err = ps.Append(ready.Entries, raftWB); err != nil {
 			return nil, err
 		}
 	}
 
-	/*region := &metapb.Region{
-		Id:          ps.region.Id,
-		StartKey:    ps.region.StartKey,
-		EndKey:      nil,
-		RegionEpoch: nil,
-		Peers:       nil,
+	if kvWB.Len() != 0 {
+		if err = kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+			return nil, err
+		}
 	}
-	var result = &ApplySnapResult{
-		PrevRegion: ps.region,
-		Region:     region,
+	if raftWB.Len() != 0 {
+		if err = raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+			return nil, err
+		}
 	}
-	ps.region = region*/
-
-	return nil, nil
+	return result, nil
 }
 
 func (ps *PeerStorage) ClearData() {
