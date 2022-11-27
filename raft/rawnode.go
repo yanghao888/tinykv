@@ -219,8 +219,8 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		r.RaftLog.stabled += uint64(len(rd.Entries))
 	}
+	r.RaftLog.maybeCompact()
 	if !IsEmptySnap(&rd.Snapshot) {
-		r.RaftLog.maybeCompact()
 		r.RaftLog.pendingSnapshot = nil
 	}
 	if len(rd.CommittedEntries) > 0 {
