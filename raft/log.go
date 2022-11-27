@@ -102,6 +102,7 @@ func (l *RaftLog) maybeCompact() {
 	newTruncatedIndex := newFirstIndex - 1
 	if newTruncatedIndex > l.dummyIndex {
 		l.entries = append([]pb.Entry{}, l.entries[newTruncatedIndex-l.dummyIndex:]...)
+		l.dummyIndex = newTruncatedIndex
 	}
 }
 
