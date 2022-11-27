@@ -180,7 +180,6 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
 
-	majority                  int
 	randomizedElectionTimeout int
 	logger                    *log.Logger
 }
@@ -204,9 +203,6 @@ func newRaft(c *Config) *Raft {
 	} else {
 		peers = cs.Nodes
 	}
-	if len(peers) == 0 {
-		peers = append(peers, c.ID)
-	}
 	prs := make(map[uint64]*Progress)
 	for _, id := range peers {
 		prs[id] = new(Progress)
@@ -220,10 +216,16 @@ func newRaft(c *Config) *Raft {
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
-		majority:         len(peers)/2 + 1,
 		logger:           log.NewLogger(os.Stdout, ""),
 	}
 	r.becomeFollower(r.Term, None)
+
+	for i, entry := range raftLog.nextEnts() {
+		if entry.EntryType == pb.EntryType_EntryConfChange {
+			r.PendingConfIndex = raftLog.applied + 1 + uint64(i)
+			break
+		}
+	}
 	return r
 }
 
@@ -284,6 +286,11 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		From:    r.id,
 		Term:    r.Term,
 	})
+}
+
+// sendTimeoutNow sends a TimeoutNow RPC to the given peer.
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: to, Term: r.Term})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -406,12 +413,10 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgTransferLeader:
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgTransferLeader,
-			To:      r.Lead,
-			From:    m.From,
-			Term:    r.Term,
-		})
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleTimeoutNow(m)
 	}
@@ -437,7 +442,7 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 			if granted {
 				count++
 			}
-			if count >= r.majority {
+			if count >= len(r.Prs)>>1+1 {
 				r.becomeLeader()
 				return
 			}
@@ -452,19 +457,17 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgTransferLeader:
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgTransferLeader,
-			To:      r.Lead,
-			From:    m.From,
-			Term:    r.Term,
-		})
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleTimeoutNow(m)
 	}
 	return nil
 }
 
-func (r *Raft) stepLeader(m pb.Message) error {
+func (r *Raft) stepLeader(m pb.Message) (err error) {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		for id := range r.Prs {
@@ -474,7 +477,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 			r.sendHeartbeat(id)
 		}
 	case pb.MessageType_MsgPropose:
-		if r.leadTransferee != 0 {
+		if r.leadTransferee != None {
 			return ErrProposalDropped
 		}
 		nextIndex := r.RaftLog.LastIndex() + 1
@@ -491,7 +494,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 		if r.standalone() {
 			r.RaftLog.committed = r.RaftLog.LastIndex()
-			return nil
+			return
 		}
 		r.broadcastAppend()
 	case pb.MessageType_MsgRequestVote:
@@ -501,7 +504,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgHeartbeatResponse:
 		if m.Term > r.Term {
 			r.becomeFollower(m.Term, None)
-			return nil
+			return
 		}
 		if m.LogTerm < r.RaftLog.lastTerm() || m.LogTerm == r.RaftLog.lastTerm() && m.Index < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
@@ -509,59 +512,13 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse:
-		if m.Term > r.Term {
-			r.becomeFollower(m.Term, None)
-			return nil
-		}
-		if !m.Reject {
-			r.Prs[m.From].Match = m.Index
-			r.Prs[m.From].Next = m.Index + 1
-			if r.updateLeaderCommit() {
-				r.broadcastAppend()
-			}
-			if r.leadTransferee != 0 && m.From == r.leadTransferee && m.Index == r.RaftLog.LastIndex() {
-				r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: m.From, Term: r.Term})
-			}
-			return nil
-		}
-		conflictTerm := m.LogTerm
-		if conflictTerm != 0 {
-			for i, dummyIndex := r.RaftLog.LastIndex(), r.RaftLog.dummyIndex; i >= dummyIndex; i-- {
-				term, _ := r.RaftLog.Term(i)
-				if term == conflictTerm {
-					r.Prs[m.From].Next = i + 1
-					r.sendAppend(m.From)
-					return nil
-				}
-				if term < conflictTerm {
-					break
-				}
-			}
-		}
-		r.Prs[m.From].Next = m.Index
-		r.sendAppend(m.From)
+		r.handleAppendEntriesResponse(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgTransferLeader:
-		r.transferLeader(m)
+		r.handleTransferLeader(m)
 	}
 	return nil
-}
-
-func (r *Raft) transferLeader(m pb.Message) {
-	if m.Term != 0 && m.Term < r.Term || m.From == r.id && r.State == StateLeader {
-		return
-	}
-	pr, ok := r.Prs[m.From]
-	if !ok {
-		return
-	}
-	r.leadTransferee = m.From
-	if pr.Match == r.RaftLog.LastIndex() {
-		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: m.From, Term: r.Term})
-	} else {
-		r.sendAppend(m.From)
-	}
 }
 
 func (r *Raft) startElection() {
@@ -602,10 +559,13 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		return
 	}
 	if m.Term > r.Term {
-		r.becomeFollower(m.Term, None)
+		r.State = StateFollower
+		r.Term = m.Term
+		r.Vote = None
 	}
 	if (r.Vote == None || r.Vote == m.From) && (m.LogTerm > r.RaftLog.lastTerm() ||
 		m.LogTerm == r.RaftLog.lastTerm() && m.Index >= r.RaftLog.LastIndex()) {
+		r.becomeFollower(m.Term, None)
 		r.Vote = m.From
 		resp.Reject = false
 	}
@@ -681,6 +641,43 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	resp.Index = r.RaftLog.LastIndex()
 }
 
+// handleAppendEntriesResponse handle AppendEntries RPC response
+func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, None)
+		return
+	}
+	if !m.Reject {
+		r.Prs[m.From].Match = m.Index
+		r.Prs[m.From].Next = m.Index + 1
+		if r.maybeCommit() {
+			r.broadcastAppend()
+		}
+		if r.leadTransferee == m.From && m.Index == r.RaftLog.LastIndex() {
+			// AppendEntryResponse 回复来自 leadTransferee，检查日志是否是最新的
+			// 如果 leadTransferee 达到了最新的日志则立即发起领导权禅让
+			r.sendTimeoutNow(m.From)
+		}
+		return
+	}
+	conflictTerm := m.LogTerm
+	if conflictTerm != 0 {
+		for i, dummyIndex := r.RaftLog.LastIndex(), r.RaftLog.dummyIndex; i >= dummyIndex; i-- {
+			term, _ := r.RaftLog.Term(i)
+			if term == conflictTerm {
+				r.Prs[m.From].Next = i + 1
+				r.sendAppend(m.From)
+				return
+			}
+			if term < conflictTerm {
+				break
+			}
+		}
+	}
+	r.Prs[m.From].Next = m.Index
+	r.sendAppend(m.From)
+}
+
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
@@ -744,51 +741,72 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	for _, id := range metadata.ConfState.Nodes {
 		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 	}
-	r.updateNodeState()
 
 	resp.Index = r.RaftLog.LastIndex()
 	resp.Reject = false
 
 }
 
-// handleTimeoutNow handle TimeoutNow RPC request
-func (r *Raft) handleTimeoutNow(m pb.Message) {
-	if m.Term < r.Term || r.Prs[r.id] == nil {
+// handleTransferLeader handle TransferLeader RPC request
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// 判断 transferee 是否在集群中
+	if _, ok := r.Prs[m.From]; !ok {
 		return
 	}
-	if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup, From: r.id, To: r.id}); err != nil {
-		r.logger.Debugf("error occurred during election: %v", err)
+	// 如果 transferee 就是 leader 自身，则无事发生
+	if m.From == r.id {
+		return
+	}
+	// 判断是否有转让流程正在进行，如果是相同节点的转让流程就返回，否则的话终止上一个转让流程
+	if r.leadTransferee != None {
+		if r.leadTransferee == m.From {
+			return
+		}
+		r.leadTransferee = None
+	}
+	r.leadTransferee = m.From
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		// 日志是最新的，直接发送 TimeoutNow 消息
+		r.sendTimeoutNow(m.From)
+	} else {
+		// 日志不是最新的，则帮助 leadTransferee 匹配最新的日志
+		r.sendAppend(m.From)
+	}
+}
+
+// handleTimeoutNow handle TimeoutNow RPC request
+func (r *Raft) handleTimeoutNow(m pb.Message) {
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+	if m.Term < r.Term {
+		return
+	}
+	if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}); err != nil {
+		log.Panic(err)
 	}
 }
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	if _, ok := r.Prs[id]; ok {
-		return
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 	}
-	r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
-	r.updateNodeState()
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
-	if _, ok := r.Prs[id]; !ok {
-		return
-	}
-	delete(r.Prs, id)
-	r.updateNodeState()
-}
-
-func (r *Raft) updateNodeState() {
-	r.majority = len(r.Prs)>>1 + 1
-	if r.standalone() {
-		if r.State != StateLeader {
-			r.becomeCandidate()
-			r.becomeLeader()
+	if _, ok := r.Prs[id]; ok {
+		delete(r.Prs, id)
+		// 如果是删除节点，由于有节点被移除了，这个时候可能有新的日志可以提交
+		// 这是必要的，因为 TinyKV 只有在 handleAppendRequestResponse 的时候才会判断是否有新的日志可以提交
+		// 如果节点被移除了，则可能会因为缺少这个节点的回复，导致可以提交的日志无法在当前任期被提交
+		if r.State == StateLeader && r.maybeCommit() {
+			log.Infof("[removeNode commit] %v leader commit new entry, commitIndex %v", r.id, r.RaftLog.committed)
+			r.broadcastAppend()
 		}
-		r.RaftLog.committed = r.RaftLog.LastIndex()
 	}
 }
 
@@ -813,7 +831,16 @@ func (r *Raft) standalone() bool {
 	return len(r.Prs) == 1 && r.Prs[r.id] != nil
 }
 
-func (r *Raft) updateLeaderCommit() bool {
+func (r *Raft) maybeCommit() bool {
+	if len(r.Prs) == 0 {
+		return false
+	} else if len(r.Prs) == 1 {
+		if _, ok := r.Prs[r.id]; ok {
+			r.RaftLog.committed = r.RaftLog.LastIndex()
+			return true
+		}
+		return false
+	}
 	matchIndex := make(uint64Slice, 0, len(r.Prs))
 	for _, pr := range r.Prs {
 		matchIndex = append(matchIndex, pr.Match)
