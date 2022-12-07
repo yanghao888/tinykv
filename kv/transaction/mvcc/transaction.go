@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"math"
 
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/codec"
@@ -93,6 +94,9 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	start := EncodeKey(key, txn.StartTS)
 	for iter.Seek(start); iter.Valid(); iter.Next() {
 		item := iter.Item()
+		if !bytes.Equal(DecodeUserKey(item.Key()), key) {
+			continue
+		}
 		val, err := item.Value()
 		if err != nil {
 			return nil, err
@@ -139,7 +143,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
-	for iter.Seek(key); iter.Valid(); iter.Next() {
+	for iter.Seek(EncodeKey(key, math.MaxUint64)); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		if !bytes.Equal(DecodeUserKey(item.Key()), key) {
 			continue
@@ -166,7 +170,7 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
-	for iter.Seek(key); iter.Valid(); iter.Next() {
+	for iter.Seek(EncodeKey(key, math.MaxUint64)); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		if !bytes.Equal(DecodeUserKey(item.Key()), key) {
 			continue
