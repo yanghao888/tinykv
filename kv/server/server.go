@@ -265,6 +265,19 @@ func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrp
 			}
 			return nil, err
 		}
+		lock, err := txn.GetLock(key)
+		if err != nil {
+			if regionErr, ok := err.(*raft_storage.RegionError); ok {
+				resp.RegionError = regionErr.RequestErr
+				return resp, nil
+			}
+			return nil, err
+		}
+
+		if lock != nil && lock.Ts <= req.Version {
+			pairs = append(pairs, &kvrpcpb.KvPair{Error: &kvrpcpb.KeyError{Locked: lock.Info(key)}, Key: key})
+			continue
+		}
 		if key == nil {
 			break
 		}
