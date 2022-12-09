@@ -3,11 +3,9 @@ package mvcc
 import (
 	"bytes"
 	"encoding/binary"
-	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
-	"math"
-
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/codec"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/tsoutil"
 )
@@ -143,7 +141,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
-	for iter.Seek(EncodeKey(key, math.MaxUint64)); iter.Valid(); iter.Next() {
+	for iter.Seek(EncodeKey(key, TsMax)); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		if !bytes.Equal(DecodeUserKey(item.Key()), key) {
 			continue
@@ -170,7 +168,7 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
-	for iter.Seek(EncodeKey(key, math.MaxUint64)); iter.Valid(); iter.Next() {
+	for iter.Seek(EncodeKey(key, TsMax)); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		if !bytes.Equal(DecodeUserKey(item.Key()), key) {
 			continue
